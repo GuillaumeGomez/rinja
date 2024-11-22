@@ -57,7 +57,7 @@ pub(crate) fn template_into_buffer(
     result
 }
 
-struct Generator<'a> {
+struct Generator<'a, 'b> {
     // The template input state: original struct AST and attributes
     input: &'a TemplateInput<'a>,
     // All contexts, keyed by the package-relative template path
@@ -65,7 +65,7 @@ struct Generator<'a> {
     // The heritage contains references to blocks and their ancestry
     heritage: Option<&'a Heritage<'a>>,
     // Variables accessible directly from the current scope (not redirected to context)
-    locals: MapChain<'a, Cow<'a, str>, LocalMeta>,
+    locals: MapChain<'b, 'a, Cow<'a, str>, LocalMeta>,
     // Suffix whitespace from the previous literal. Will be flushed to the
     // output buffer unless suppressed by whitespace suppression on the next
     // non-literal.
@@ -81,15 +81,15 @@ struct Generator<'a> {
     is_in_filter_block: usize,
 }
 
-impl<'a> Generator<'a> {
-    fn new<'n>(
+impl<'a, 'b> Generator<'a, 'b> {
+    fn new<'n: 'q, 'q>(
         input: &'n TemplateInput<'_>,
         contexts: &'n HashMap<&'n Arc<Path>, Context<'n>, FxBuildHasher>,
         heritage: Option<&'n Heritage<'_>>,
-        locals: MapChain<'n, Cow<'n, str>, LocalMeta>,
+        locals: MapChain<'q, 'n, Cow<'n, str>, LocalMeta>,
         buf_writable_discard: bool,
         is_in_filter_block: usize,
-    ) -> Generator<'n> {
+    ) -> Generator<'n, 'q> {
         Generator {
             input,
             contexts,
@@ -966,12 +966,11 @@ impl<'a> Generator<'a> {
             Some(heritage) => heritage.root,
             None => child_ctx,
         };
-        let locals = MapChain::with_parent(&self.locals);
         let mut child = Self::new(
             self.input,
             self.contexts,
             heritage.as_ref(),
-            locals,
+            MapChain::with_parent(&self.locals),
             self.buf_writable.discard,
             self.is_in_filter_block,
         );
@@ -1164,12 +1163,7 @@ impl<'a> Generator<'a> {
             // lifetimes `&'a MapChain<'a, 'b, K, V>`, making the `parent` field take
             // `<'b, 'b, ...>`. Except... it doesn't work because `self` still doesn't live long
             // enough here for some reason...
-            MapChain::with_parent(unsafe {
-                mem::transmute::<
-                    &MapChain<'_, Cow<'_, str>, LocalMeta>,
-                    &MapChain<'_, Cow<'_, str>, LocalMeta>,
-                >(&self.locals)
-            }),
+            MapChain::with_parent(&self.locals),
             self.buf_writable.discard,
             self.is_in_filter_block,
         );
@@ -2643,7 +2637,7 @@ enum EvaluatedResult {
 }
 
 impl<'a> Conds<'a> {
-    fn compute_branches(generator: &Generator<'a>, i: &'a If<'a>) -> Self {
+    fn compute_branches(generator: &Generator<'a, '_>, i: &'a If<'a>) -> Self {
         let mut conds = Vec::with_capacity(i.branches.len());
         let mut ws_before = None;
         let mut ws_after = None;
@@ -2767,19 +2761,19 @@ impl LocalMeta {
 }
 
 #[derive(Debug, Clone)]
-struct MapChain<'a, K, V>
+struct MapChain<'a, 'b, K, V>
 where
     K: cmp::Eq + hash::Hash,
 {
-    parent: Option<&'a MapChain<'a, K, V>>,
+    parent: Option<&'a MapChain<'b, 'b, K, V>>,
     scopes: Vec<HashMap<K, V, FxBuildHasher>>,
 }
 
-impl<'a, K: 'a, V: 'a> MapChain<'a, K, V>
+impl<'a, 'b: 'a, K: 'b, V: 'b> MapChain<'a, 'b, K, V>
 where
     K: cmp::Eq + hash::Hash,
 {
-    fn with_parent<'p>(parent: &'p MapChain<'_, K, V>) -> MapChain<'p, K, V> {
+    fn with_parent(parent: &'a MapChain<'b, 'b, K, V>) -> MapChain<'a, 'b, K, V> {
         MapChain {
             parent: Some(parent),
             scopes: vec![HashMap::default()],
@@ -2817,7 +2811,7 @@ where
     }
 }
 
-impl MapChain<'_, Cow<'_, str>, LocalMeta> {
+impl MapChain<'_, '_, Cow<'_, str>, LocalMeta> {
     fn resolve(&self, name: &str) -> Option<String> {
         let name = normalize_identifier(name);
         self.get(&Cow::Borrowed(name)).map(|meta| match &meta.refs {
@@ -2832,7 +2826,7 @@ impl MapChain<'_, Cow<'_, str>, LocalMeta> {
     }
 }
 
-impl<'a, K: Eq + hash::Hash, V> Default for MapChain<'a, K, V> {
+impl<'a, 'b, K: Eq + hash::Hash, V> Default for MapChain<'a, 'b, K, V> {
     fn default() -> Self {
         Self {
             parent: None,
