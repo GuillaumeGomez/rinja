@@ -28,9 +28,14 @@ pub(crate) fn template_to_string(
     target: Option<&str>,
 ) -> Result<usize, CompileError> {
     let ctx = &contexts[&input.path];
-    let mut vars = MapChain::default();
-    vars.insert(Cow::Borrowed("VALUES"), LocalMeta::initialized());
-    let generator = Generator::new(input, contexts, heritage, vars, input.block.is_some(), 0);
+    let generator = Generator::new(
+        input,
+        contexts,
+        heritage,
+        MapChain::default(),
+        input.block.is_some(),
+        0,
+    );
     let mut result = generator.build(ctx, buf, target);
     if let Err(err) = &mut result {
         if err.span.is_none() {
@@ -119,7 +124,12 @@ impl<'a, 'h> Generator<'a, 'h> {
     ) -> Result<usize, CompileError> {
         write_header(self.input.ast, buf, target);
         buf.write(
-            "fn render_into_with_values<V: rinja::Values, RinjaW>(&self, __rinja_writer: &mut RinjaW, VALUES: &V) -> rinja::Result<()>\
+            "\
+            fn render_into_with_values<RinjaW>(\
+                &self,\
+                __rinja_writer: &mut RinjaW,\
+                __rinja_values: &dyn rinja::Values\
+            ) -> rinja::Result<()>\
             where \
                 RinjaW: rinja::helpers::core::fmt::Write + ?rinja::helpers::core::marker::Sized\
             {\

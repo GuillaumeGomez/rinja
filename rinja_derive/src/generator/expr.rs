@@ -254,7 +254,8 @@ impl<'a> Generator<'a, '_> {
             "pluralize" => Self::_visit_pluralize_filter,
             "ref" => Self::_visit_ref_filter,
             "safe" => Self::_visit_safe_filter,
-            "urlencode" | "urlencode_strict" => Self::_visit_urlencode,
+            "urlencode" | "urlencode_strict" => Self::_visit_urlencode_filter,
+            "value" => Self::_visit_value_filter,
             name if BUILTIN_FILTERS.contains(&name) => Self::_visit_builtin_filter,
             _ => Self::_visit_custom_filter,
         };
@@ -292,7 +293,7 @@ impl<'a> Generator<'a, '_> {
         Ok(DisplayWrap::Unwrapped)
     }
 
-    fn _visit_urlencode(
+    fn _visit_urlencode_filter(
         &mut self,
         ctx: &Context<'_>,
         buf: &mut Buffer,
@@ -585,6 +586,9 @@ impl<'a> Generator<'a, '_> {
                 return Ok(DisplayWrap::Unwrapped);
             }
         }
+
+        #[allow(unknown_lints)]
+        #[allow(clippy::literal_string_with_formatting_args)]
         Err(ctx.generate_error(r#"use filter fmt like `value|fmt("{:?}")`"#, node))
     }
 
@@ -609,6 +613,67 @@ impl<'a> Generator<'a, '_> {
         }
         buf.write(")?");
         Ok(DisplayWrap::Unwrapped)
+    }
+
+    fn _visit_value_filter(
+        &mut self,
+        ctx: &Context<'_>,
+        buf: &mut Buffer,
+        _name: &str,
+        args: &[WithSpan<'_, Expr<'a>>],
+        node: Span<'_>,
+    ) -> Result<DisplayWrap, CompileError> {
+        buf.write("rinja::helpers::get_value");
+        let key = match args {
+            [key] => key,
+            [key, ty] => {
+                buf.write("::<");
+                self._visit_ty(ctx, buf, ty)?;
+                buf.write('>');
+                key
+            }
+            _ => {
+                return Err(ctx.generate_error(
+                    "the `value` filter expects at most one argument, the type",
+                    node,
+                ));
+            }
+        };
+        buf.write("(&__rinja_values, &(");
+        self._visit_arg(ctx, buf, key)?;
+        buf.write("))");
+        Ok(DisplayWrap::Unwrapped)
+    }
+
+    fn _visit_ty(
+        &mut self,
+        ctx: &Context<'_>,
+        buf: &mut Buffer,
+        ty: &WithSpan<'_, Expr<'a>>,
+    ) -> Result<(), CompileError> {
+        match &**ty {
+            Expr::Var(ty) => {
+                buf.write(normalize_identifier(ty));
+            }
+            Expr::Path(ty) => {
+                self.visit_path(buf, ty);
+            }
+            Expr::Unary("&", rhs) => {
+                buf.write('&');
+                self._visit_ty(ctx, buf, rhs.as_ref())?;
+            }
+            Expr::BinOp(token @ ("<" | ">"), lhs, rhs) => {
+                self._visit_ty(ctx, buf, lhs.as_ref())?;
+                buf.write(token);
+                self._visit_ty(ctx, buf, rhs.as_ref())?;
+            }
+            _ => {
+                return Err(
+                    ctx.generate_error("expected a type name, not an expression", ty.span())
+                );
+            }
+        }
+        Ok(())
     }
 
     fn _visit_args(

@@ -1,163 +1,192 @@
-#![allow(clippy::new_without_default)]
-
-#[cfg(feature = "alloc")]
-use alloc::boxed::Box;
 use core::any::Any;
 use core::borrow::Borrow;
-use core::cmp::Ord;
 
-/// Used to store values of any type at runtime.
-///
-/// It is implemented on `HashMap` (when the `std` feature is enabled),
-/// on `BTreeMap` (when the `alloc` feature is enabled) and on slices.
-pub trait Values {
-    /// Add a new entry.
-    #[cfg_attr(feature = "alloc", doc = "```")]
-    #[cfg_attr(not(feature = "alloc"), doc = "```ignore")]
-    /// use core::any::Any;
-    /// use alloc::collections::BTreeMap;
-    /// use rinja::Values;
-    ///
-    /// let mut v: BTreeMap<String, Box<dyn Any>> = BTreeMap::default();
-    ///
-    /// v.add_value("Hello".into(), 12u8);
-    /// ```
-    fn add_value(&mut self, key: impl Borrow<str>, value: impl Any);
+use crate::Error;
 
-    /// Retrieve an entry added with the [`add_value`][Self::add_value] method or
-    /// already present in the type on which this trait is implemented.
-    ///
-    #[cfg_attr(feature = "alloc", doc = "```")]
-    #[cfg_attr(not(feature = "alloc"), doc = "```ignore")]
-    /// use core::any::Any;
-    /// use alloc::collections::BTreeMap;
-    /// use rinja::Values;
-    ///
-    /// let mut v: BTreeMap<String, Box<dyn Any>> = BTreeMap::default();
-    ///
-    /// v.add_value("Hello".into(), 12u8);
-    /// assert_eq!(v.get_value::<u8>("Hell", Err(ValueError::NotPresent)));
-    /// assert_eq!(v.get_value::<usize>("Hello", Err(ValueError::WrongType)));
-    /// assert_eq!(v.get_value::<u8>("Hello", Ok(12u8)));
-    /// ```
-    fn get_value<T: 'static>(&self, key: &(impl Borrow<str> + ?Sized)) -> Result<&T, ValueError>;
+/// No runtime values provided.
+pub const NO_VALUES: &dyn Values = &();
+
+/// Try to find `key` in `values` and then to convert it to `T`.
+pub fn get_value<T: Any>(values: &dyn Values, key: impl AsRef<str>) -> Result<&T, Error> {
+    let Some(src) = values.get_value(key.as_ref()) else {
+        return Err(Error::ValueMissing);
+    };
+
+    if let Some(value) = src.downcast_ref::<T>() {
+        return Ok(value);
+    } else if let Some(value) = src.downcast_ref::<&T>() {
+        return Ok(value);
+    }
+
+    #[cfg(feature = "alloc")]
+    if let Some(value) = src.downcast_ref::<alloc::boxed::Box<T>>() {
+        return Ok(value);
+    } else if let Some(value) = src.downcast_ref::<alloc::rc::Rc<T>>() {
+        return Ok(value);
+    } else if let Some(value) = src.downcast_ref::<alloc::sync::Arc<T>>() {
+        return Ok(value);
+    }
+
+    Err(Error::ValueType)
 }
 
-/// Returned by [`Values::get`].
-#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ValueError {
-    /// Returned in cases there is no value with the given key.
-    NotPresent,
-    /// Returned if the given value doesn't have the provided type.
-    WrongType,
+/// A runtime value store for [`Template::render_with_values()`][crate::Template::render_with_values].
+pub trait Values {
+    /// Try to find `key` in this store.
+    fn get_value<'a>(&'a self, key: &str) -> Option<&'a dyn Any>;
+}
+
+crate::impl_for_ref! {
+    impl Values for T {
+        #[inline]
+        fn get_value<'a>(&'a self, key: &str) -> Option<&'a dyn Any> {
+            T::get_value(self, key)
+        }
+    }
+}
+
+impl Values for () {
+    #[inline]
+    fn get_value<'a>(&'a self, _: &str) -> Option<&'a dyn Any> {
+        None
+    }
+}
+
+impl<T: Values> Values for Option<T> {
+    #[inline]
+    fn get_value<'a>(&'a self, key: &str) -> Option<&'a dyn Any> {
+        self.as_ref()?.get_value(key)
+    }
+}
+
+impl<K, V, const N: usize> Values for [(K, V); N]
+where
+    K: Borrow<str>,
+    V: Value,
+{
+    #[inline]
+    fn get_value<'a>(&'a self, key: &str) -> Option<&'a dyn Any> {
+        self.as_slice().get_value(key)
+    }
+}
+
+impl<K, V> Values for [(K, V)]
+where
+    K: Borrow<str>,
+    V: Value,
+{
+    fn get_value<'a>(&'a self, key: &str) -> Option<&'a dyn Any> {
+        for (k, v) in self {
+            if k.borrow() == key {
+                return v.ref_any();
+            }
+        }
+        None
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<K, V> Values for alloc::collections::BTreeMap<K, V>
+where
+    K: Borrow<str> + core::cmp::Ord,
+    V: Value,
+{
+    #[inline]
+    fn get_value<'a>(&'a self, key: &str) -> Option<&'a dyn Any> {
+        self.get(key)?.ref_any()
+    }
 }
 
 #[cfg(feature = "std")]
-impl<K: for<'a> From<&'a str> + Borrow<str> + Ord + core::hash::Hash + ?Sized> Values
-    for std::collections::HashMap<K, Box<dyn Any>>
+impl<K, V, S> Values for std::collections::HashMap<K, V, S>
+where
+    K: Borrow<str> + Eq + core::hash::Hash,
+    V: Value,
+    S: core::hash::BuildHasher,
 {
-    fn add_value(&mut self, key: impl Borrow<str>, value: impl Any) {
-        let key: &str = key.borrow();
-        self.insert(key.into(), Box::new(value));
+    #[inline]
+    fn get_value<'a>(&'a self, key: &str) -> Option<&'a dyn Any> {
+        self.get(key)?.ref_any()
     }
+}
 
-    fn get_value<T: 'static>(&self, key: &(impl Borrow<str> + ?Sized)) -> Result<&T, ValueError> {
-        let key: &str = key.borrow();
-        let Some(value) = self.get(key.into()) else {
-            return Err(ValueError::NotPresent);
-        };
-        match value.downcast_ref::<T>() {
-            Some(v) => Ok(v),
-            None => Err(ValueError::WrongType),
+/// A value in a [`Values`] collection.
+///
+/// This is <code>[dyn](https://doc.rust-lang.org/stable/std/keyword.dyn.html) [Any]</code>,
+/// <code>[Option]&lt;dyn Any&gt;</code>, or a reference to either.
+pub trait Value {
+    /// Returns a reference to this value unless it is `None`.
+    fn ref_any(&self) -> Option<&dyn Any>;
+}
+
+crate::impl_for_ref! {
+    impl Value for T {
+        #[inline]
+        fn ref_any(&self) -> Option<&dyn Any> {
+            T::ref_any(self)
         }
     }
 }
 
-#[cfg(feature = "alloc")]
-impl<K: for<'a> From<&'a str> + Ord> Values for alloc::collections::BTreeMap<K, Box<dyn Any>> {
-    fn add_value(&mut self, key: impl Borrow<str>, value: impl Any) {
-        let key: &str = key.borrow();
-        self.insert(key.into(), Box::new(value));
-    }
-
-    fn get_value<T: 'static>(&self, key: &(impl Borrow<str> + ?Sized)) -> Result<&T, ValueError> {
-        let key: &str = key.borrow();
-        let Some(value) = self.get(&key.into()) else {
-            return Err(ValueError::NotPresent);
-        };
-        match value.downcast_ref::<T>() {
-            Some(v) => Ok(v),
-            None => Err(ValueError::WrongType),
-        }
+impl Value for dyn Any {
+    #[inline]
+    fn ref_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
 }
 
-impl<'a, K: Borrow<str> + PartialEq> Values for &'a [(K, &'a dyn Any)] {
-    /// This method does nothing on this type.
-    fn add_value(&mut self, _key: impl Borrow<str>, _value: impl Any) {}
-    fn get_value<T: 'static>(&self, key: &(impl Borrow<str> + ?Sized)) -> Result<&T, ValueError> {
-        let key = key.borrow();
-        let Some(value) = self.iter().find_map(|(i_key, value)| {
-            if key == i_key.borrow() {
-                Some(value)
-            } else {
-                None
-            }
-        }) else {
-            return Err(ValueError::NotPresent);
-        };
-        match value.downcast_ref::<T>() {
-            Some(v) => Ok(v),
-            None => Err(ValueError::WrongType),
-        }
+impl<T: Value> Value for Option<T> {
+    #[inline]
+    fn ref_any(&self) -> Option<&dyn Any> {
+        T::ref_any(self.as_ref()?)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+
     use super::*;
 
     #[cfg(feature = "std")]
     #[test]
     fn values_on_hashmap() {
+        use alloc::boxed::Box;
+        use alloc::string::String;
         use std::collections::HashMap;
-        use std::string::String;
 
         let mut values: HashMap<String, Box<dyn Any>> = HashMap::new();
         values.insert("a".into(), Box::new(10u32));
         values.insert("c".into(), Box::new("blam"));
-        values.add_value("b", 12u32);
-
-        assert_eq!(values.get_value::<u32>("a"), Ok(&10u32));
-        assert_eq!(values.get_value::<&str>("c"), Ok(&"blam"));
-        assert_eq!(values.get_value::<u8>("a"), Err(ValueError::WrongType));
-        assert_eq!(values.get_value::<u8>("d"), Err(ValueError::NotPresent));
+        assert_matches!(get_value::<u32>(&values, "a"), Ok(&10u32));
+        assert_matches!(get_value::<&str>(&values, "c"), Ok(&"blam"));
+        assert_matches!(get_value::<u8>(&values, "a"), Err(Error::ValueType));
+        assert_matches!(get_value::<u8>(&values, "d"), Err(Error::ValueMissing));
     }
 
     #[cfg(feature = "alloc")]
     #[test]
     fn values_on_btreemap() {
+        use alloc::boxed::Box;
         use alloc::collections::BTreeMap;
-        use std::string::String;
+        use alloc::string::String;
 
         let mut values: BTreeMap<String, Box<dyn Any>> = BTreeMap::new();
         values.insert("a".into(), Box::new(10u32));
         values.insert("c".into(), Box::new("blam"));
-        values.add_value("b", 12u32);
 
-        assert_eq!(values.get_value::<u32>("a"), Ok(&10u32));
-        assert_eq!(values.get_value::<&str>("c"), Ok(&"blam"));
-        assert_eq!(values.get_value::<u8>("a"), Err(ValueError::WrongType));
-        assert_eq!(values.get_value::<u8>("d"), Err(ValueError::NotPresent));
+        assert_matches!(get_value::<u32>(&values, "a"), Ok(&10u32));
+        assert_matches!(get_value::<&str>(&values, "c"), Ok(&"blam"));
+        assert_matches!(get_value::<u8>(&values, "a"), Err(Error::ValueType));
+        assert_matches!(get_value::<u8>(&values, "d"), Err(Error::ValueMissing));
     }
 
     #[test]
     fn values_on_slice() {
         let values: &[(&str, &dyn Any)] = &[("a", &12u32), ("c", &"blam")];
-
-        assert_eq!(values.get_value::<u32>("a"), Ok(&12u32));
-        assert_eq!(values.get_value::<&str>("c"), Ok(&"blam"));
-        assert_eq!(values.get_value::<u8>("a"), Err(ValueError::WrongType));
-        assert_eq!(values.get_value::<u8>("d"), Err(ValueError::NotPresent));
+        assert_matches!(get_value::<u32>(&values, "a"), Ok(12u32));
+        assert_matches!(get_value::<&str>(&values, "c"), Ok(&"blam"));
+        assert_matches!(get_value::<u8>(&values, "a"), Err(Error::ValueType));
+        assert_matches!(get_value::<u8>(&values, "d"), Err(Error::ValueMissing));
     }
 }
